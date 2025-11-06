@@ -1208,6 +1208,60 @@ func (s *State) HandleNodeFromAuthPath(
 			Msg("Node re-authorized")
 
 		finalNode = updatedNodeView
+	} else if existingNodeByHostname, existsByHostname := s.nodeStore.GetNodeByUserAndHostname(types.UserID(user.ID), hostname); existsByHostname && existingNodeByHostname.Valid() {
+		log.Info().
+			Caller().
+			Str("registration_id", registrationID.String()).
+			Str("user.name", user.Username()).
+			Str("registrationMethod", registrationMethod).
+			Str("node.name", existingNodeByHostname.Hostname()).
+			Uint64("node.id", existingNodeByHostname.ID().Uint64()).
+			Msg("Reusing existing node by hostname for same user with new machine key")
+
+		updatedNodeView, ok := s.nodeStore.UpdateNode(existingNodeByHostname.ID(), func(node *types.Node) {
+			node.MachineKey = regEntry.Node.MachineKey
+			node.NodeKey = regEntry.Node.NodeKey
+			node.DiscoKey = regEntry.Node.DiscoKey
+			node.Hostname = hostname
+
+			node.Hostinfo = validHostinfo
+			node.Hostinfo.NetInfo = preserveNetInfo(existingNodeByHostname, existingNodeByHostname.ID(), validHostinfo)
+
+			node.Endpoints = regEntry.Node.Endpoints
+			node.RegisterMethod = regEntry.Node.RegisterMethod
+			node.IsOnline = ptr.To(false)
+			node.LastSeen = ptr.To(time.Now())
+
+			if expiry != nil {
+				node.Expiry = expiry
+			} else {
+				node.Expiry = regEntry.Node.Expiry
+			}
+		})
+		if !ok {
+			return types.NodeView{}, change.EmptySet, fmt.Errorf("node not found in NodeStore: %d", existingNodeByHostname.ID())
+		}
+
+		_, err = hsdb.Write(s.db.DB, func(tx *gorm.DB) (*types.Node, error) {
+			if err := tx.Save(updatedNodeView.AsStruct()).Error; err != nil {
+				return nil, fmt.Errorf("failed to save node: %w", err)
+			}
+			return nil, nil
+		})
+		if err != nil {
+			return types.NodeView{}, change.EmptySet, err
+		}
+
+		log.Trace().
+			Caller().
+			Str("node.name", updatedNodeView.Hostname()).
+			Uint64("node.id", updatedNodeView.ID().Uint64()).
+			Str("machine.key", regEntry.Node.MachineKey.ShortString()).
+			Str("node.key", updatedNodeView.NodeKey().ShortString()).
+			Str("user.name", user.Name).
+			Msg("Node re-authorized with hostname-based reuse")
+
+		finalNode = updatedNodeView
 	} else {
 		// Node does not exist for this user with this machine key
 		// Check if node exists with this machine key for a different user (for netinfo preservation)
@@ -1399,6 +1453,64 @@ func (s *State) HandleNodeFromPreAuthKey(
 			Str("node.key", updatedNodeView.NodeKey().ShortString()).
 			Str("user.name", pak.User.Username()).
 			Msg("Node re-authorized")
+
+		finalNode = updatedNodeView
+	} else if existingNodeByHostname, existsByHostname := s.nodeStore.GetNodeByUserAndHostname(types.UserID(pak.User.ID), hostname); existsByHostname && existingNodeByHostname.Valid() {
+		log.Info().
+			Caller().
+			Str("node.name", existingNodeByHostname.Hostname()).
+			Uint64("node.id", existingNodeByHostname.ID().Uint64()).
+			Str("machine.key.new", machineKey.ShortString()).
+			Str("user.name", pak.User.Username()).
+			Msg("Reusing existing node by hostname for same user with new machine key (pre-auth)")
+
+		updatedNodeView, ok := s.nodeStore.UpdateNode(existingNodeByHostname.ID(), func(node *types.Node) {
+			node.MachineKey = machineKey
+			node.NodeKey = regReq.NodeKey
+			node.Hostname = hostname
+
+			node.Hostinfo = validHostinfo
+			node.Hostinfo.NetInfo = preserveNetInfo(existingNodeByHostname, existingNodeByHostname.ID(), validHostinfo)
+
+			node.RegisterMethod = util.RegisterMethodAuthKey
+			node.ForcedTags = pak.Proto().GetAclTags()
+			node.AuthKey = pak
+			node.AuthKeyID = &pak.ID
+			node.IsOnline = ptr.To(false)
+			node.LastSeen = ptr.To(time.Now())
+			node.Expiry = &regReq.Expiry
+		})
+
+		if !ok {
+			return types.NodeView{}, change.EmptySet, fmt.Errorf("node not found in NodeStore: %d", existingNodeByHostname.ID())
+		}
+
+		_, err = hsdb.Write(s.db.DB, func(tx *gorm.DB) (*types.Node, error) {
+			if err := tx.Save(updatedNodeView.AsStruct()).Error; err != nil {
+				return nil, fmt.Errorf("failed to save node: %w", err)
+			}
+
+			if !pak.Reusable {
+				err = hsdb.UsePreAuthKey(tx, pak)
+				if err != nil {
+					return nil, fmt.Errorf("using pre auth key: %w", err)
+				}
+			}
+
+			return nil, nil
+		})
+		if err != nil {
+			return types.NodeView{}, change.EmptySet, fmt.Errorf("writing node to database: %w", err)
+		}
+
+		log.Trace().
+			Caller().
+			Str("node.name", updatedNodeView.Hostname()).
+			Uint64("node.id", updatedNodeView.ID().Uint64()).
+			Str("machine.key", machineKey.ShortString()).
+			Str("node.key", updatedNodeView.NodeKey().ShortString()).
+			Str("user.name", pak.User.Username()).
+			Msg("Node re-authorized with hostname-based reuse (pre-auth)")
 
 		finalNode = updatedNodeView
 	} else {

@@ -588,3 +588,31 @@ func (s *NodeStore) ListNodesByUser(uid types.UserID) views.Slice[types.NodeView
 
 	return views.SliceOf(s.data.Load().nodesByUser[uid])
 }
+
+// GetNodeByUserAndHostname returns the most recently updated node for a user matching the provided hostname.
+// The hostname comparison is case-insensitive. The bool indicates whether a matching node was found.
+func (s *NodeStore) GetNodeByUserAndHostname(uid types.UserID, hostname string) (types.NodeView, bool) {
+	timer := prometheus.NewTimer(nodeStoreOperationDuration.WithLabelValues("get_by_user_hostname"))
+	defer timer.ObserveDuration()
+
+	nodeStoreOperations.WithLabelValues("get_by_user_hostname").Inc()
+
+	snapshot := s.data.Load()
+	nodes := snapshot.nodesByUser[uid]
+
+	var candidate types.NodeView
+
+	for _, node := range nodes {
+		if strings.EqualFold(node.Hostname(), hostname) {
+			if !candidate.Valid() || node.UpdatedAt().After(candidate.UpdatedAt()) {
+				candidate = node
+			}
+		}
+	}
+
+	if candidate.Valid() {
+		return candidate, true
+	}
+
+	return types.NodeView{}, false
+}
